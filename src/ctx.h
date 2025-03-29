@@ -43,11 +43,18 @@
 //        #define CTX_NO_TEMP
 //            Disables the built in temp context and its functions.
 //
+//        #define CTX_NO_STR
+//            Disables the string helper functions.
+//
 //        #define CTX_TEMP_SIZE X
 //            Defines the size of the built in temporary context, will default to 1MB.
 //
 //        #define CTX_LOG(...)
 //            If you do not wish to use printf, you can use this to use a custom logger.
+//
+//    CHANGELOG:
+//        1.0.0 (2025-03-01) - Initial release.
+//        1.1.0 (2025-03-29) - Added forget functions and string helpers with config.
 //
 //    LICENSE:
 //        Copyright (c) 2025 Alex Macafee
@@ -77,9 +84,9 @@
 #define CTX_H
 
 #define CTX_VERSION_MAJOR 1
-#define CTX_VERSION_MINOR 0
+#define CTX_VERSION_MINOR 1
 #define CTX_VERSION_PATCH 0
-#define CTX_VERSION       "1.0.0"
+#define CTX_VERSION       "1.1.0"
 
 #ifdef _WIN32
 #if defined(CTX_BUILD_SHARED)
@@ -130,9 +137,15 @@
 // -----------------------------------------------------------------------------
 #include <stddef.h>
 
+#ifndef CTX_NO_STR
+#include <stdarg.h>
+#include <string.h>
+#endif
+
 typedef struct Context {
     void* buffer;
     size_t location;
+    size_t last_location;
     size_t size;
 } Context;
 
@@ -142,12 +155,25 @@ extern "C" {
 
 CTX_API Context new_context (size_t size);
 CTX_API void* context_alloc (Context* context, size_t size);
+CTX_API size_t context_forget (Context* context);
+
+#ifndef CTX_NO_STR
+CTX_API char* context_alloc_cstring (Context* context, const char* str);
+CTX_API char* context_alloc_cstringf (Context* context, const char* fmt, ...);
+#endif
 
 CTX_API void context_clear (Context* context);
 CTX_API void context_free (Context* context);
 
 #ifndef CTX_NO_TEMP
 CTX_API void* context_talloc (size_t size);
+CTX_API size_t context_tforget (void);
+
+#ifndef CTX_NO_STR
+CTX_API char* context_talloc_cstring (const char* str);
+CTX_API char* context_talloc_cstringf (const char* fmt, ...);
+#endif
+
 CTX_API void context_tclear (void);
 CTX_API void context_tfree (void);
 #endif // CTX_NO_TEMP
@@ -159,10 +185,11 @@ CTX_API void context_tfree (void);
 // -----------------------------------------------------------------------------
 // function IMPLEMENTATION
 // -----------------------------------------------------------------------------
+#define CTX_IMPL
 #if defined(CTX_IMPL) || defined(CTX_IMPLEMENTATION)
 
 #ifndef CTX_NO_TEMP
-static Context global_temp_context = {NULL, 0, 0};
+static Context global_temp_context = {NULL, 0, 0, 0};
 #endif
 
 #ifdef __cplusplus
@@ -171,9 +198,10 @@ extern "C" {
 
 Context new_context (size_t size) {
     Context ctx = {
-        .buffer   = CTX_MALLOC (size),
-        .location = 0,
-        .size     = size,
+        .buffer        = CTX_MALLOC (size),
+        .location      = 0,
+        .last_location = 0,
+        .size          = size,
     };
 
     return ctx;
@@ -185,6 +213,8 @@ void* context_alloc (Context* context, size_t size) {
         return NULL;
     }
 
+    context->last_location = context->location;
+
     char* buffer_start = (void*)context->buffer;
     void* chunk        = &buffer_start[context->location];
 
@@ -192,11 +222,64 @@ void* context_alloc (Context* context, size_t size) {
     return chunk;
 }
 
+size_t context_forget (Context* context) {
+    if (context->last_location > context->location) {
+        CTX_LOG ("[ERROR]: Cannot forget last allocation!\n");
+        return 0;
+    }
+
+    size_t reverted   = context->location - context->last_location;
+    context->location = context->last_location;
+
+    return reverted;
+}
+
+#ifndef CTX_NO_STR
+char* context_alloc_cstring (Context* context, const char* str) {
+    size_t string_length = strlen (str);
+
+    char* chunk = context_alloc (context, string_length + 1);
+    if (chunk == NULL) {
+        return NULL;
+    }
+
+    strcpy (chunk, str);
+
+    return chunk;
+}
+
+char* context_alloc_cstringf (Context* context, const char* fmt, ...) {
+    va_list args;
+    va_start (args, fmt);
+
+    va_list args_copy;
+    va_copy (args_copy, args);
+    size_t string_length = vsnprintf (NULL, 0, fmt, args_copy) + 1;
+    va_end (args_copy);
+
+    char* buffer = context_alloc (context, string_length);
+    if (buffer == NULL) {
+        va_end (args);
+        return NULL;
+    }
+
+    vsnprintf (buffer, string_length, fmt, args);
+    va_end (args);
+
+    return NULL;
+}
+#endif
+
 void context_clear (Context* context) {
-    context->location = 0;
+    context->location      = 0;
+    context->last_location = 0;
 }
 
 void context_free (Context* context) {
+    context->last_location = 0;
+    context->location      = 0;
+    context->size          = 0;
+
     CTX_FREE (context->buffer);
 }
 
@@ -206,19 +289,47 @@ void* context_talloc (size_t size) {
         global_temp_context = new_context (CTX_TEMP_SIZE);
     }
 
-    Context* tmp = &global_temp_context;
+    return context_alloc (&global_temp_context, size);
+}
 
-    if (tmp->location + size > tmp->size) {
-        CTX_LOG ("[ERROR]: Temporary context unable to allocate %zu bytes!", size);
+size_t context_tforget (void) {
+    return context_forget (&global_temp_context);
+}
+
+#ifndef CTX_NO_STR
+char* context_talloc_cstring (const char* str) {
+    if (global_temp_context.size == 0) {
+        global_temp_context = new_context (CTX_TEMP_SIZE);
+    }
+
+    return context_alloc_cstring (&global_temp_context, str);
+}
+
+char* context_talloc_cstringf (const char* fmt, ...) {
+    if (global_temp_context.size == 0) {
+        global_temp_context = new_context (CTX_TEMP_SIZE);
+    }
+
+    va_list args;
+    va_start (args, fmt);
+
+    va_list args_copy;
+    va_copy (args_copy, args);
+    size_t string_length = vsnprintf (NULL, 0, fmt, args_copy) + 1;
+    va_end (args_copy);
+
+    char* buffer = context_alloc (&global_temp_context, string_length);
+    if (buffer == NULL) {
+        va_end (args);
         return NULL;
     }
 
-    char* buffer_start = (void*)tmp->buffer;
-    void* chunk        = &buffer_start[tmp->location];
+    vsnprintf (buffer, string_length, fmt, args);
+    va_end (args);
 
-    tmp->location += size;
-    return chunk;
+    return buffer;
 }
+#endif
 
 void context_tclear (void) {
     context_clear (&global_temp_context);
